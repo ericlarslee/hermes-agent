@@ -1654,7 +1654,23 @@ class TestXmppMarkdownStyling:
         assert _xmpp.markdown_to_styling("`**x**`") == "`**x**`"
 
     def test_fenced_block_contents_are_not_translated(self):
-        src = "```python\n**x** = 1\n```"
+        # Contents survive verbatim; only the info string on the opening
+        # fence is dropped (see the language-tag test below).
+        assert _xmpp.markdown_to_styling(
+            "```python\n**x** = 1\n```"
+        ) == "```\n**x** = 1\n```"
+
+    def test_fenced_block_language_tag_is_dropped(self):
+        # XEP-0393 §6.1.2 says the remainder of the opening fence line is not
+        # displayed, but clients differ on honouring it and a language tag
+        # buys nothing on XMPP (no client syntax-highlights). Emit a bare
+        # fence so a non-compliant client can't leak "python" into the body.
+        assert _xmpp.markdown_to_styling(
+            "```python\nx = 1\n```"
+        ) == "```\nx = 1\n```"
+
+    def test_fenced_block_without_tag_is_unchanged(self):
+        src = "```\nx = 1\n```"
         assert _xmpp.markdown_to_styling(src) == src
 
     def test_fenced_block_survives_alongside_prose(self):

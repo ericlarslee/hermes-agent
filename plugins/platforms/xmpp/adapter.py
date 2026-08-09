@@ -413,8 +413,22 @@ def markdown_to_styling(text: Optional[str]) -> str:
         masked.append(match.group(0))
         return _MASK.format(len(masked) - 1)
 
+    def _hide_fence(match: "re.Match[str]") -> str:
+        block = match.group(0)
+        # XEP-0393 §6.1.2: a preformatted block starts at any line beginning
+        # with ``` and the remainder of that line is NOT displayed — so a
+        # Markdown info string like ```python is legal. Clients vary on
+        # honouring it though, and the tag buys nothing here (no XMPP client
+        # syntax-highlights), so drop it rather than risk it leaking into the
+        # rendered body.
+        newline = block.find("\n")
+        if newline != -1:
+            block = "```" + block[newline:]
+        masked.append(block)
+        return _MASK.format(len(masked) - 1)
+
     # Fences first — they may legitimately contain single backticks.
-    out = _FENCE_RE.sub(_hide, text)
+    out = _FENCE_RE.sub(_hide_fence, text)
     out = _CODESPAN_RE.sub(_hide, out)
 
     lines = out.split("\n")
