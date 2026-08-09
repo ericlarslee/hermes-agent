@@ -35,6 +35,8 @@ import json
 import logging
 import mimetypes
 import os
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -374,6 +376,84 @@ def _parse_muc_rooms(value: str, default_nick: Optional[str]) -> List[_MucRoom]:
     return rooms
 
 
+# ---------------------------------------------------------------------------
+# XEP-0393 Message Styling (ADR-0004)
+# ---------------------------------------------------------------------------
+
+_MASK = "\x00{}\x00"
+_MASK_RE = re.compile(r"\x00(\d+)\x00")
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_CODESPAN_RE = re.compile(r"`[^`\n]+`")
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$")
+_STAR_BULLET_RE = re.compile(r"^(\s*)\*(\s+)")
+_LINK_RE = re.compile(r"\[([^\]]+)\]\((\S+?)\)")
+_BOLD_STAR_RE = re.compile(r"\*\*(\S(?:.*?\S)?)\*\*", re.DOTALL)
+_BOLD_UNDER_RE = re.compile(r"__(\S(?:.*?\S)?)__", re.DOTALL)
+_STRIKE_RE = re.compile(r"~~(\S(?:.*?\S)?)~~", re.DOTALL)
+_ITALIC_STAR_RE = re.compile(r"(?<![\w*])\*(\S(?:.*?\S)?)\*(?![\w*])", re.DOTALL)
+
+
+def markdown_to_styling(text: Optional[str]) -> str:
+    """Translate agent Markdown into XEP-0393 Message Styling.
+
+    This is a translation, not a pass-through. The two syntaxes collide —
+    Markdown bolds with ``**``, Styling with a single ``*`` — so emitting
+    Markdown unchanged is the bug this fixes, not a shortcut (ADR-0004).
+
+    Code spans and fenced blocks are literal in both syntaxes, so they are
+    masked out before any substitution runs and restored afterwards; markup
+    inside them must survive verbatim.
+    """
+    if not text:
+        return ""
+
+    masked: List[str] = []
+
+    def _hide(match: "re.Match[str]") -> str:
+        masked.append(match.group(0))
+        return _MASK.format(len(masked) - 1)
+
+    # Fences first — they may legitimately contain single backticks.
+    out = _FENCE_RE.sub(_hide, text)
+    out = _CODESPAN_RE.sub(_hide, out)
+
+    lines = out.split("\n")
+    for i, line in enumerate(lines):
+        heading = _HEADING_RE.match(line)
+        if heading and heading.group(1):
+            # Styling has no heading primitive; bold is the closest reading,
+            # and is far better than printing a literal '#'. Masked, or the
+            # italic pass below would rewrite the '*' pair we just emitted.
+            masked.append(f"*{heading.group(1)}*")
+            lines[i] = _MASK.format(len(masked) - 1)
+            continue
+        # A leading "* " is a bullet, not an emphasis run. Normalise it before
+        # the italic pass can mistake it for styling.
+        lines[i] = _STAR_BULLET_RE.sub(r"\1-\2", line)
+    out = "\n".join(lines)
+
+    # Styling has no link primitive, but clients linkify bare URLs.
+    out = _LINK_RE.sub(r"\1 (\2)", out)
+
+    # Bold resolves to a mask so the italic pass cannot re-enter the single
+    # asterisks it just produced.
+    def _bold(match: "re.Match[str]") -> str:
+        masked.append(f"*{match.group(1)}*")
+        return _MASK.format(len(masked) - 1)
+
+    out = _BOLD_STAR_RE.sub(_bold, out)
+    out = _BOLD_UNDER_RE.sub(_bold, out)
+    out = _STRIKE_RE.sub(r"~\1~", out)
+    out = _ITALIC_STAR_RE.sub(r"_\1_", out)
+
+    # Restore; a bold mask may itself contain a code-span mask, so iterate.
+    for _ in range(5):
+        if not _MASK_RE.search(out):
+            break
+        out = _MASK_RE.sub(lambda m: masked[int(m.group(1))], out)
+    return out
+
+
 class XmppAdapter(BasePlatformAdapter):
     """slixmpp-backed adapter satisfying BasePlatformAdapter.
 
@@ -406,9 +486,31 @@ class XmppAdapter(BasePlatformAdapter):
     # ever sees it.
     splits_long_messages = True
 
+    # Bodies are translated to XEP-0393 Message Styling on the way out, which
+    # shares Markdown's fenced-block syntax — so gateway/run.py can render a
+    # tool command as a real code block instead of the truncated preview.
+    supports_code_blocks = True
+
+    # Opt in to the base class's shared reaction-ack flow
+    # (BasePlatformAdapter.on_processing_complete). It drives the whole
+    # lifecycle; this adapter only supplies the _add_reaction /
+    # _remove_reaction primitives below. Requires XEP-0444 (ADR-0004).
+    _ACK_EMOJI = "👀"
+    _OK_EMOJI = "✅"
+    _FAIL_EMOJI = "❌"
+
+    # Minimum gap between streaming corrections to the same message. Token
+    # streaming outruns human reading and every correction is a stanza, so
+    # intermediate edits are coalesced. A finalize=True edit always goes out
+    # regardless — it carries the real answer.
+    EDIT_THROTTLE_SECS = 1.5
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
         extra = config.extra or {}
+
+        # message_id -> monotonic timestamp of its last emitted correction.
+        self._last_edit_at: Dict[str, float] = {}
 
         # Operators can tune the per-message cap (a server with a tighter
         # max_stanza_size can lower it). Falls back to the class default on
@@ -538,8 +640,11 @@ class XmppAdapter(BasePlatformAdapter):
         client = slixmpp.ClientXMPP(self.jid, self._password)
         # Plugins we need: chat states, MUC, HTTP File Upload, OOB, disco,
         # ping, delayed delivery (MUC history detection), EME hints.
+        # xep_0308 (Last Message Correction) and xep_0444 (Message Reactions)
+        # back edit_message() and the reaction-ack flow respectively; both
+        # degrade to a no-op when registration fails (ADR-0004).
         for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199",
-                       "xep_0203", "xep_0363", "xep_0380"):
+                       "xep_0203", "xep_0308", "xep_0363", "xep_0380", "xep_0444"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
@@ -962,6 +1067,11 @@ class XmppAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="xmpp not connected", retryable=True)
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
 
+        # Translate Markdown to XEP-0393 Styling before anything else, so both
+        # the encrypted and plaintext paths carry the same body and chunking
+        # measures the text that actually goes on the wire (ADR-0004).
+        content = markdown_to_styling(content)
+
         # OMEMO-encrypt 1:1 messages when the plugin is active. Group chats
         # stay plaintext: reliable MUC OMEMO needs non-anonymous rooms and
         # per-occupant device discovery, deferred for now. A failed
@@ -1156,6 +1266,145 @@ class XmppAdapter(BasePlatformAdapter):
             self.client.send_message(mto=chat_id, mtype=mtype, mchat_state="active")
         except Exception:
             logger.debug("xmpp: stop_typing failed", exc_info=True)
+
+    # -----------------------------------------------------------------
+    # Reactions (XEP-0444) — primitives for the base-class ack flow
+    # -----------------------------------------------------------------
+
+    async def _send_reactions(self, chat_id: str, message_id: str, emojis) -> None:
+        """Emit the COMPLETE reaction set for one target stanza.
+
+        XEP-0444 is set-based, not incremental: each stanza replaces the
+        sender's whole set for that target, so an empty iterable is the
+        removal. That maps directly onto the base class's remove-then-add
+        ordering in ``on_processing_complete``.
+        """
+        if self.client is None or "xep_0444" not in self._registered_plugins:
+            return
+        if not message_id:
+            return
+        try:
+            self.client["xep_0444"].send_reactions(
+                slixmpp.JID(chat_id), to_id=message_id, reactions=list(emojis)
+            )
+        except Exception:
+            logger.debug("xmpp: send_reactions failed", exc_info=True)
+
+    async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> None:
+        await self._send_reactions(chat_id, message_id, [emoji])
+
+    async def _remove_reaction(self, chat_id: str, message_id: str) -> None:
+        await self._send_reactions(chat_id, message_id, [])
+
+    # -----------------------------------------------------------------
+    # Corrections (XEP-0308)
+    # -----------------------------------------------------------------
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Replace a previously sent message via XEP-0308.
+
+        Returning ``success=False`` is a supported outcome — the caller falls
+        back to sending a new message — so every unsupported case declines
+        rather than raising.
+        """
+        if self.client is None:
+            return SendResult(success=False, error="xmpp not connected", retryable=True)
+        if not message_id:
+            return SendResult(success=False, error="no message id to correct")
+        # MUC corrections are scoped per-occupant and interact with muc_mam in
+        # ways v1 has not validated (ADR-0004): decline and let the caller
+        # send a fresh message instead.
+        if self._is_muc(chat_id):
+            return SendResult(success=False, error="corrections unsupported in MUC")
+        if "xep_0308" not in self._registered_plugins:
+            return SendResult(success=False, error="XEP-0308 unavailable")
+
+        now = time.monotonic()
+        last = self._last_edit_at.get(message_id)
+        if (
+            not finalize
+            and last is not None
+            and (now - last) < self.EDIT_THROTTLE_SECS
+        ):
+            # Coalesce: report success so the stream keeps running. The next
+            # edit past the window (or the finalize) carries the newer text.
+            return SendResult(success=True, message_id=message_id)
+        self._last_edit_at[message_id] = now
+
+        body = markdown_to_styling(content)
+        try:
+            if (
+                "xep_0384" in self._registered_plugins
+                and SLIXMPP_OMEMO_AVAILABLE
+            ):
+                return await self._send_correction_encrypted(chat_id, message_id, body)
+
+            correction = self.client["xep_0308"].build_correction(
+                id_to_replace=message_id,
+                mto=chat_id,
+                mtype="chat",
+                mbody=body,
+            )
+            correction.send()
+            return SendResult(
+                success=True, message_id=message_id, raw_response=correction
+            )
+        except Exception as exc:
+            logger.warning("xmpp: correction of %s failed: %s", message_id, exc)
+            return SendResult(success=False, error=str(exc), retryable=True)
+
+    async def _send_correction_encrypted(
+        self, chat_id: str, message_id: str, body: str
+    ) -> SendResult:
+        """OMEMO-encrypt a correction.
+
+        A correction is an ordinary stanza carrying <replace/>, so it must be
+        encrypted on the same path as a normal body — correcting the
+        plaintext would be a silent, retroactive E2E downgrade. Note that
+        ``encrypt_message`` strips non-OMEMO elements, so <replace/> is
+        attached to the ENCRYPTED stanza afterwards, exactly as the chat
+        state is in ``_send_encrypted_one``.
+        """
+        client = self.client
+        stanza = client.make_message(mto=chat_id, mtype="chat")
+        stanza["body"] = body
+        stanza.set_from(client.boundjid)
+
+        message, encryption_errors = await client["xep_0384"].encrypt_message(
+            stanza, {slixmpp.JID(chat_id)}
+        )
+        if encryption_errors:
+            logger.info("OMEMO: correction non-critical errors: %s", encryption_errors)
+
+        if message is None:
+            # No usable OMEMO devices — a plaintext correction still beats
+            # leaving a stale partial reply on screen.
+            correction = client["xep_0308"].build_correction(
+                id_to_replace=message_id, mto=chat_id, mtype="chat", mbody=body,
+            )
+            correction.send()
+            return SendResult(
+                success=True, message_id=message_id, raw_response=correction
+            )
+
+        message["replace"]["id"] = message_id
+        if "xep_0380" in self._registered_plugins:
+            try:
+                import oldmemo
+                ns = oldmemo.oldmemo.NAMESPACE
+                message["eme"]["namespace"] = ns
+                message["eme"]["name"] = client["xep_0380"].mechanisms[ns]
+            except Exception:
+                pass
+        message.send()
+        return SendResult(success=True, message_id=message_id, raw_response=message)
 
     async def send_image_file(
         self,

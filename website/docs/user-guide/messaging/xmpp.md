@@ -110,6 +110,25 @@ The agent can deliver files natively. When it emits `MEDIA:/absolute/path/to/fil
 
 Modern XMPP clients render that URL inline as a file/image bubble. There's no separate "attachment" UI — the URL *is* the attachment in XEP-0363.
 
+### Rich presentation
+
+The adapter uses three presentation XEPs so replies read the way they do on Telegram or Discord. All three degrade to a no-op if the server or client doesn't support them — nothing breaks, you just lose the effect.
+
+| Feature | XEP | What you see |
+|---------|-----|--------------|
+| Formatting | XEP-0393 Message Styling | Bold, italic, strikethrough, inline code and code blocks render as formatting instead of raw `**asterisks**` |
+| Live replies | XEP-0308 Last Message Correction | A long answer updates one message in place as it streams, rather than arriving as a wall of text or a burst of fragments |
+| Acknowledgement | XEP-0444 Message Reactions | Your message gets 👀 while the agent works, swapped for ✅ or ❌ when it finishes |
+
+Two things worth knowing:
+
+- **Formatting is translated, not passed through.** The agent writes Markdown, which is a *different* syntax from Message Styling — Markdown bolds with `**`, Styling with a single `*`. The adapter converts between them. Code spans and fenced blocks are left byte-for-byte intact, so markup inside a code sample survives. Headings become bold lines and Markdown links become `text (url)`, because Styling has no heading or link primitive.
+- **Corrections are 1:1 only.** In MUC rooms, corrections are scoped per-occupant and interact with server-side archiving in ways that aren't yet validated, so group replies are sent as ordinary new messages.
+
+Corrections are what let XMPP use the same display profile as Telegram: streaming replies, mid-turn commentary, and periodic heartbeats on long runs, without a running log of every tool call. Tune it under `display.platforms.xmpp.*` — for example `tool_progress: all` to see each tool as it runs.
+
+Clients that predate XEP-0308 will show each correction as a new message rather than an edit. That's inherent to the XEP, not a bug in the adapter.
+
 ---
 
 ## Slash commands
@@ -153,5 +172,8 @@ All standard gateway slash commands work over XMPP:
 | Federation | Yes | No | No |
 | Native file rendering in clients | Yes (XEP-0363) | Yes | Yes |
 | Group chat | Yes (MUC) | Yes | Yes |
+| Rich text formatting | Yes (XEP-0393) | No | Yes |
+| Streaming / edited replies | Yes, 1:1 (XEP-0308) | No | Yes |
+| Reaction acknowledgements | Yes (XEP-0444) | No | Yes |
 
 XMPP is the right choice when you want the bot reachable from any client, on any device, without a third-party gateway. Self-hosted Prosody on a LAN gives you a local-only chat with a Hermes agent that never crosses the internet.

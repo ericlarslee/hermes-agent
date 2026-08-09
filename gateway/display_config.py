@@ -136,6 +136,19 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # as metadata rather than content, so reasoning summaries default to it
     # here instead of the fenced code block used elsewhere.
     "discord":     {**_TIER_HIGH, "reasoning_style": "subtext"},
+    # XMPP earns Tier 1 via XEP-0308 Last Message Correction (ADR-0004), so
+    # progress and streaming edit one bubble instead of stacking messages.
+    # The profile deliberately mirrors Telegram's: Conversations and Monal are
+    # mobile inboxes, so keep interim commentary and long-running heartbeats
+    # (otherwise a long turn looks like "composing…" forever) but drop the
+    # per-tool commentary and the verbose iteration counter. Without this
+    # entry the platform fell through to _GLOBAL_DEFAULTS, i.e. tool_progress
+    # "all" — the chattiest setting there is.
+    "xmpp":        {
+        **_TIER_HIGH,
+        "tool_progress": "off",
+        "busy_ack_detail": False,
+    },
 
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;

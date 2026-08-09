@@ -1619,6 +1619,258 @@ class TestXmppOmemoConnect:
 
 
 # ---------------------------------------------------------------------------
+# XEP-0393 Message Styling (ADR-0004)
+#
+# The agent emits Markdown; Styling is a DIFFERENT syntax that collides with
+# it (single vs double asterisk for bold), so outbound bodies are translated,
+# never passed through.
+# ---------------------------------------------------------------------------
+
+class TestXmppMarkdownStyling:
+    def test_double_asterisk_bold_becomes_single(self):
+        assert _xmpp.markdown_to_styling("**bold**") == "*bold*"
+
+    def test_underscore_bold_becomes_single_asterisk(self):
+        assert _xmpp.markdown_to_styling("__bold__") == "*bold*"
+
+    def test_bold_inline_in_sentence(self):
+        assert _xmpp.markdown_to_styling("a **b** c") == "a *b* c"
+
+    def test_single_asterisk_italic_becomes_underscore(self):
+        assert _xmpp.markdown_to_styling("*it*") == "_it_"
+
+    def test_underscore_italic_preserved(self):
+        assert _xmpp.markdown_to_styling("_it_") == "_it_"
+
+    def test_strikethrough_collapses_to_single_tilde(self):
+        assert _xmpp.markdown_to_styling("~~no~~") == "~no~"
+
+    def test_atx_heading_becomes_bold_line(self):
+        assert _xmpp.markdown_to_styling("## Title") == "*Title*"
+        assert _xmpp.markdown_to_styling("# Title") == "*Title*"
+
+    def test_inline_code_contents_are_not_translated(self):
+        # A code span is literal: markdown inside it must survive verbatim.
+        assert _xmpp.markdown_to_styling("`**x**`") == "`**x**`"
+
+    def test_fenced_block_contents_are_not_translated(self):
+        src = "```python\n**x** = 1\n```"
+        assert _xmpp.markdown_to_styling(src) == src
+
+    def test_fenced_block_survives_alongside_prose(self):
+        src = "see **this**:\n```\n**raw**\n```\nand **that**"
+        out = _xmpp.markdown_to_styling(src)
+        assert "see *this*:" in out
+        assert "**raw**" in out          # inside the fence, untouched
+        assert out.endswith("and *that*")
+
+    def test_blockquote_preserved(self):
+        assert _xmpp.markdown_to_styling("> quoted") == "> quoted"
+
+    def test_markdown_link_becomes_text_and_bare_url(self):
+        # Conversations linkifies bare URLs but does not render md links.
+        assert _xmpp.markdown_to_styling(
+            "[docs](https://e.org)"
+        ) == "docs (https://e.org)"
+
+    def test_dash_list_marker_preserved(self):
+        assert _xmpp.markdown_to_styling("- item") == "- item"
+
+    def test_asterisk_list_marker_normalized_not_italicised(self):
+        # Regression guard: a leading "* " is a bullet, not an emphasis run.
+        assert _xmpp.markdown_to_styling("* item") == "- item"
+
+    def test_lone_asterisk_is_left_alone(self):
+        # Unmatched "*" is common in prose/maths and must not become styling.
+        assert _xmpp.markdown_to_styling("2 * 3 = 6") == "2 * 3 = 6"
+
+    def test_plain_text_unchanged(self):
+        assert _xmpp.markdown_to_styling("just text") == "just text"
+
+    def test_empty_string_safe(self):
+        assert _xmpp.markdown_to_styling("") == ""
+
+    def test_none_safe(self):
+        assert _xmpp.markdown_to_styling(None) == ""
+
+
+class TestXmppStylingAppliedOnSend:
+    @pytest.mark.asyncio
+    async def test_send_translates_markdown_body(self, monkeypatch):
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter.client = MagicMock()
+        sent = []
+        adapter.client.send_message = (
+            lambda **kw: sent.append(kw) or MagicMock(__getitem__=lambda s, k: "m1")
+        )
+
+        await adapter.send("alice@example.org", "**bold** and `code`")
+        assert sent[0]["mbody"] == "*bold* and `code`"
+
+    def test_adapter_declares_code_block_support(self, monkeypatch):
+        # Drives gateway/run.py to render tool progress as a fenced block
+        # instead of the truncated plain-text preview.
+        adapter = _make_xmpp_adapter(monkeypatch)
+        assert adapter.supports_code_blocks is True
+
+
+# ---------------------------------------------------------------------------
+# XEP-0444 Message Reactions — drives the base-class ack flow (ADR-0004)
+# ---------------------------------------------------------------------------
+
+class TestXmppReactions:
+    def test_ack_emoji_attributes_are_set(self, monkeypatch):
+        adapter = _make_xmpp_adapter(monkeypatch)
+        assert adapter._ACK_EMOJI
+        assert adapter._OK_EMOJI
+        assert adapter._FAIL_EMOJI
+
+    @pytest.mark.asyncio
+    async def test_add_reaction_sends_singleton_set(self, monkeypatch):
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter.client = MagicMock()
+        adapter._registered_plugins.add("xep_0444")
+        send_reactions = MagicMock()
+        adapter.client.__getitem__ = MagicMock(
+            return_value=MagicMock(send_reactions=send_reactions)
+        )
+
+        await adapter._add_reaction("alice@example.org", "msg-7", "👀")
+
+        kwargs = send_reactions.call_args.kwargs
+        args = send_reactions.call_args.args
+        assert (kwargs.get("to_id") or args[1]) == "msg-7"
+        reactions = kwargs.get("reactions") or args[2]
+        assert list(reactions) == ["👀"]
+
+    @pytest.mark.asyncio
+    async def test_remove_reaction_sends_empty_set(self, monkeypatch):
+        # XEP-0444 is set-based: an empty set IS the removal.
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter.client = MagicMock()
+        adapter._registered_plugins.add("xep_0444")
+        send_reactions = MagicMock()
+        adapter.client.__getitem__ = MagicMock(
+            return_value=MagicMock(send_reactions=send_reactions)
+        )
+
+        await adapter._remove_reaction("alice@example.org", "msg-7")
+
+        kwargs = send_reactions.call_args.kwargs
+        args = send_reactions.call_args.args
+        reactions = kwargs.get("reactions") if "reactions" in kwargs else args[2]
+        assert list(reactions) == []
+
+    @pytest.mark.asyncio
+    async def test_reactions_noop_when_xep0444_unavailable(self, monkeypatch):
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter.client = MagicMock()
+        # xep_0444 deliberately NOT registered
+        getitem = MagicMock()
+        adapter.client.__getitem__ = getitem
+
+        await adapter._add_reaction("alice@example.org", "m", "👀")
+        await adapter._remove_reaction("alice@example.org", "m")
+        getitem.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reactions_noop_without_message_id(self, monkeypatch):
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter.client = MagicMock()
+        adapter._registered_plugins.add("xep_0444")
+        getitem = MagicMock()
+        adapter.client.__getitem__ = getitem
+
+        await adapter._add_reaction("alice@example.org", "", "👀")
+        getitem.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# XEP-0308 Last Message Correction — the tier unlock (ADR-0004)
+# ---------------------------------------------------------------------------
+
+class TestXmppCorrections:
+    def _prep(self, monkeypatch, **extra):
+        adapter = _make_xmpp_adapter(monkeypatch, **extra)
+        adapter.client = MagicMock()
+        adapter._registered_plugins.add("xep_0308")
+        built = MagicMock()
+        built.send = MagicMock()
+        correction = MagicMock(build_correction=MagicMock(return_value=built))
+        adapter.client.__getitem__ = MagicMock(return_value=correction)
+        return adapter, correction, built
+
+    @pytest.mark.asyncio
+    async def test_edit_message_builds_correction_for_prior_id(self, monkeypatch):
+        adapter, correction, built = self._prep(monkeypatch)
+
+        result = await adapter.edit_message("alice@example.org", "old-1", "new text")
+
+        assert result.success is True
+        kwargs = correction.build_correction.call_args.kwargs
+        assert kwargs.get("id_to_replace") == "old-1"
+        assert kwargs.get("mbody") == "new text"
+        built.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_edit_message_translates_markdown(self, monkeypatch):
+        adapter, correction, _ = self._prep(monkeypatch)
+        await adapter.edit_message("alice@example.org", "old-1", "**b**")
+        assert correction.build_correction.call_args.kwargs.get("mbody") == "*b*"
+
+    @pytest.mark.asyncio
+    async def test_edit_message_declines_in_muc(self, monkeypatch):
+        # MUC corrections are per-occupant and interact with muc_mam in ways
+        # v1 has not validated — decline so the caller sends a new message.
+        adapter, correction, _ = self._prep(
+            monkeypatch, muc_rooms="room@conference.example.org"
+        )
+        result = await adapter.edit_message(
+            "room@conference.example.org", "old-1", "new"
+        )
+        assert result.success is False
+        correction.build_correction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_edit_message_declines_when_xep0308_unavailable(self, monkeypatch):
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter.client = MagicMock()
+        getitem = MagicMock()
+        adapter.client.__getitem__ = getitem
+
+        result = await adapter.edit_message("alice@example.org", "old-1", "new")
+        assert result.success is False
+        getitem.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rapid_intermediate_edits_are_throttled(self, monkeypatch):
+        adapter, correction, _ = self._prep(monkeypatch)
+        adapter.EDIT_THROTTLE_SECS = 60.0  # nothing should pass but the first
+
+        first = await adapter.edit_message("alice@example.org", "old-1", "one")
+        second = await adapter.edit_message("alice@example.org", "old-1", "two")
+
+        assert first.success is True
+        assert second.success is True  # reported OK; simply coalesced
+        assert correction.build_correction.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_finalize_edit_always_sends(self, monkeypatch):
+        # The last edit carries the real answer — it must never be dropped by
+        # the throttle.
+        adapter, correction, _ = self._prep(monkeypatch)
+        adapter.EDIT_THROTTLE_SECS = 60.0
+
+        await adapter.edit_message("alice@example.org", "old-1", "partial")
+        result = await adapter.edit_message(
+            "alice@example.org", "old-1", "final", finalize=True
+        )
+
+        assert result.success is True
+        assert correction.build_correction.call_count == 2
+        assert correction.build_correction.call_args.kwargs.get("mbody") == "final"
+
+
 # One-shot sender must not clobber platform health state
 #
 # send_xmpp_message() attaches as a short-lived second resource. It already
