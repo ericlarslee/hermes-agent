@@ -526,6 +526,9 @@ class XmppAdapter(BasePlatformAdapter):
         # message_id -> monotonic timestamp of its last emitted correction.
         self._last_edit_at: Dict[str, float] = {}
 
+        # message_id -> (clarify_id, choices) for the seeded reaction picker.
+        self._pending_clarifies: Dict[str, Any] = {}
+
         # Operators can tune the per-message cap (a server with a tighter
         # max_stanza_size can lower it). Falls back to the class default on
         # any bad value.
@@ -704,6 +707,10 @@ class XmppAdapter(BasePlatformAdapter):
         # Register "message" only — it already covers chat/normal/groupchat.
         client.add_event_handler("message", self._on_message)
         client.add_event_handler("disconnected", self._on_disconnected)
+        # XEP-0444 inbound: slixmpp raises "reactions" with the stanza. Drives
+        # the clarify picker (ADR-0005); harmless when nothing is pending.
+        if "xep_0444" in self._registered_plugins:
+            client.add_event_handler("reactions", self._on_reactions)
         # Handle "failed_all_auth" (fired once, after every SASL mechanism the
         # server offered has been exhausted) rather than "failed_auth" (fired
         # once per *rejected* mechanism). slixmpp moves on to the next
@@ -1309,6 +1316,83 @@ class XmppAdapter(BasePlatformAdapter):
 
     async def _remove_reaction(self, chat_id: str, message_id: str) -> None:
         await self._send_reactions(chat_id, message_id, [])
+
+    # -----------------------------------------------------------------
+    # Clarify picker (ADR-0005)
+    # -----------------------------------------------------------------
+
+    # XMPP has no inline-button primitive — XEP-0004 Data Forms exist but
+    # Conversations/Dino render them only in registration / MUC-config /
+    # ad-hoc-command flows, never inline in a chat. Seeded reactions are the
+    # closest tappable equivalent: we react to our own question with one digit
+    # per choice, and the user taps one. Two taps rather than Telegram's one,
+    # but it is a real picker. The numbered-text fallback still works, so
+    # replying "2" remains equivalent to tapping 2️⃣.
+    _CHOICE_EMOJI = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣",
+                     "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟")
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        # The base implementation renders the numbered list AND arms the
+        # gateway's text intercept; both are wanted, so build on it rather
+        # than replacing it.
+        result = await super().send_clarify(
+            chat_id, question, choices, clarify_id, session_key, metadata
+        )
+        if not (choices and result.success and result.message_id):
+            return result
+        # Reactions in MUC are per-occupant and would let any member resolve
+        # another's prompt; group chats keep the plain numbered list.
+        if self._is_muc(chat_id) or "xep_0444" not in self._registered_plugins:
+            return result
+        seeded = self._CHOICE_EMOJI[:len(list(choices))]
+        if not seeded:
+            return result
+        self._pending_clarifies[result.message_id] = (clarify_id, list(choices))
+        await self._send_reactions(chat_id, result.message_id, seeded)
+        return result
+
+    async def _on_reactions(self, message: Any) -> None:
+        """Resolve a pending clarify when the user taps a seeded digit."""
+        try:
+            payload = message["reactions"]
+            target = str(payload["id"])
+            values = list(payload["values"])
+            sender = self._bare(str(message.get_from()))
+        except Exception:
+            return
+        # Our own seeded reactions echo back — never self-resolve.
+        if sender == self._bare(self.jid):
+            return
+        pending = self._pending_clarifies.get(target)
+        if not pending:
+            return
+        clarify_id, choices = pending
+        if not self._is_authorized(
+            chat_type="dm", chat_id=sender, user_jid=sender
+        ):
+            logger.debug("xmpp: ignoring clarify reaction from %s (not allowed)", sender)
+            return
+        for emoji in values:
+            if emoji not in self._CHOICE_EMOJI:
+                continue
+            idx = self._CHOICE_EMOJI.index(emoji)
+            if idx >= len(choices):
+                continue
+            try:
+                from tools.clarify_gateway import resolve_gateway_clarify
+                if resolve_gateway_clarify(clarify_id, str(choices[idx])):
+                    self._pending_clarifies.pop(target, None)
+            except Exception:
+                logger.debug("xmpp: clarify resolve failed", exc_info=True)
+            return
 
     # -----------------------------------------------------------------
     # Corrections (XEP-0308)

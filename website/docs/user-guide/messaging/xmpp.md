@@ -119,6 +119,27 @@ The adapter uses three presentation XEPs so replies read the way they do on Tele
 | Formatting | XEP-0393 Message Styling | Bold, italic, strikethrough, inline code and code blocks render as formatting instead of raw `**asterisks**` |
 | Live replies | XEP-0308 Last Message Correction | A long answer updates one message in place as it streams, rather than arriving as a wall of text or a burst of fragments |
 | Acknowledgement | XEP-0444 Message Reactions | Your message gets 👀 while the agent works, swapped for ✅ or ❌ when it finishes |
+| Choosing an option | XEP-0444 Message Reactions | When the agent asks a multiple-choice question it reacts to its own message with 1️⃣2️⃣3️⃣…; tap one to answer |
+
+### Answering a multiple-choice question
+
+When the agent needs you to pick between options it sends a numbered list:
+
+```
+❓ Which database should I migrate first?
+
+  1. postgres
+  2. mysql
+  3. sqlite
+
+Reply with the number, the option text, or your own answer.
+```
+
+You can answer three ways, all equivalent: **tap** one of the seeded digit reactions, **type** the number (`2`), or **type** the option text. Multi-select questions accept `1, 3`.
+
+XMPP has no inline-button primitive — Data Forms (XEP-0004) are only rendered by clients in registration, MUC-config and ad-hoc-command flows, not inline in a chat — so seeded reactions are the closest tappable equivalent. It's two taps rather than one (most clients need long-press → react), and it caps at ten options. If your client doesn't support reactions the digits simply don't appear and the numbered list still works.
+
+Group chats keep the plain numbered list: MUC reactions are per-occupant, and seeding a picker there would let any member answer another member's prompt.
 
 Two things worth knowing:
 

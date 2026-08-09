@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 slixmpp = pytest.importorskip("slixmpp")
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import SendResult
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
 # Load plugins/platforms/xmpp/adapter.py under plugin_adapter_xmpp so it
@@ -50,6 +51,17 @@ class _StanzaStub(dict):
     def __init__(self, *, stanza_type, from_jid, body, stanza_id="incoming-1"):
         super().__init__(type=stanza_type, body=body, id=stanza_id)
         self["from"] = _Jid(from_jid)
+
+    def get_from(self):
+        return self["from"]
+
+
+class _ReactionStub(dict):
+    """Duck-typed slixmpp Message carrying a XEP-0444 <reactions/> payload."""
+    def __init__(self, from_jid, target_id, values):
+        super().__init__()
+        self["from"] = _Jid(from_jid)
+        self["reactions"] = {"id": target_id, "values": list(values)}
 
     def get_from(self):
         return self["from"]
@@ -1972,3 +1984,151 @@ class TestXmppEphemeralSenderStateIsolation:
         await adapter._on_disconnected(None)
         assert fatal == []
         adapter._notify_fatal_error.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Clarify picker via XEP-0444 reactions (ADR-0005)
+#
+# XMPP has no inline-button primitive, so the closest thing to Telegram's
+# tappable keyboard is seeding digit reactions on the question and letting the
+# user tap one. The numbered-text fallback keeps working in parallel.
+# ---------------------------------------------------------------------------
+
+class TestXmppClarifyReactionPicker:
+    def _adapter(self, monkeypatch, **extra):
+        adapter = _make_xmpp_adapter(
+            monkeypatch, allowed_users="alice@example.org", **extra
+        )
+        adapter.client = MagicMock()
+        adapter._registered_plugins.add("xep_0444")
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="q-1")
+        )
+        adapter._send_reactions = AsyncMock()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_seeds_one_digit_reaction_per_choice(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        await adapter.send_clarify(
+            "alice@example.org", "Pick one", ["a", "b", "c"], "cl-1", "sess"
+        )
+        args = adapter._send_reactions.call_args.args
+        assert args[1] == "q-1"
+        assert list(args[2]) == ["1️⃣", "2️⃣", "3️⃣"]
+
+    @pytest.mark.asyncio
+    async def test_open_ended_clarify_seeds_nothing(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        await adapter.send_clarify("alice@example.org", "Say something", None, "cl-1", "s")
+        adapter._send_reactions.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_picker_capped_at_ten(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        await adapter.send_clarify(
+            "alice@example.org", "Pick", [str(i) for i in range(15)], "cl-1", "s"
+        )
+        assert len(adapter._send_reactions.call_args.args[2]) == 10
+
+    @pytest.mark.asyncio
+    async def test_no_picker_in_muc(self, monkeypatch):
+        # Reactions in MUC are per-occupant and the ack semantics differ;
+        # group chats keep the plain numbered list.
+        adapter = self._adapter(monkeypatch, muc_rooms="room@conference.example.org")
+        await adapter.send_clarify(
+            "room@conference.example.org", "Pick", ["a", "b"], "cl-1", "s"
+        )
+        adapter._send_reactions.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_tapping_a_digit_resolves_that_choice(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        await adapter.send_clarify(
+            "alice@example.org", "Pick", ["alpha", "beta", "gamma"], "cl-1", "s"
+        )
+        resolved = []
+        with patch(
+            "tools.clarify_gateway.resolve_gateway_clarify",
+            side_effect=lambda cid, resp: resolved.append((cid, resp)) or True,
+        ):
+            await adapter._on_reactions(
+                _ReactionStub("alice@example.org", "q-1", ["2️⃣"])
+            )
+        assert resolved == [("cl-1", "beta")]
+
+    @pytest.mark.asyncio
+    async def test_our_own_seeded_reactions_are_ignored(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        await adapter.send_clarify(
+            "alice@example.org", "Pick", ["alpha", "beta"], "cl-1", "s"
+        )
+        resolved = []
+        with patch(
+            "tools.clarify_gateway.resolve_gateway_clarify",
+            side_effect=lambda cid, resp: resolved.append((cid, resp)) or True,
+        ):
+            await adapter._on_reactions(
+                _ReactionStub("hermes@example.org", "q-1", ["1️⃣"])
+            )
+        assert resolved == []
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_sender_cannot_resolve(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        await adapter.send_clarify(
+            "alice@example.org", "Pick", ["alpha", "beta"], "cl-1", "s"
+        )
+        resolved = []
+        with patch(
+            "tools.clarify_gateway.resolve_gateway_clarify",
+            side_effect=lambda cid, resp: resolved.append((cid, resp)) or True,
+        ):
+            await adapter._on_reactions(
+                _ReactionStub("mallory@example.org", "q-1", ["1️⃣"])
+            )
+        assert resolved == []
+
+    @pytest.mark.asyncio
+    async def test_reaction_on_unknown_message_is_ignored(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        resolved = []
+        with patch(
+            "tools.clarify_gateway.resolve_gateway_clarify",
+            side_effect=lambda cid, resp: resolved.append((cid, resp)) or True,
+        ):
+            await adapter._on_reactions(
+                _ReactionStub("alice@example.org", "not-a-question", ["1️⃣"])
+            )
+        assert resolved == []
+
+    @pytest.mark.asyncio
+    async def test_non_digit_reaction_does_not_resolve(self, monkeypatch):
+        # A plain 👍 on the question is not a selection.
+        adapter = self._adapter(monkeypatch)
+        await adapter.send_clarify(
+            "alice@example.org", "Pick", ["alpha"], "cl-1", "s"
+        )
+        resolved = []
+        with patch(
+            "tools.clarify_gateway.resolve_gateway_clarify",
+            side_effect=lambda cid, resp: resolved.append((cid, resp)) or True,
+        ):
+            await adapter._on_reactions(_ReactionStub("alice@example.org", "q-1", ["👍"]))
+        assert resolved == []
+
+    @pytest.mark.asyncio
+    async def test_digit_beyond_choice_count_is_ignored(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        await adapter.send_clarify(
+            "alice@example.org", "Pick", ["alpha", "beta"], "cl-1", "s"
+        )
+        resolved = []
+        with patch(
+            "tools.clarify_gateway.resolve_gateway_clarify",
+            side_effect=lambda cid, resp: resolved.append((cid, resp)) or True,
+        ):
+            await adapter._on_reactions(
+                _ReactionStub("alice@example.org", "q-1", ["9️⃣"])
+            )
+        assert resolved == []
